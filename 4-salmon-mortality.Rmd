@@ -1,0 +1,2708 @@
+---
+title: "4-salmon-mortality"
+output: 
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(error = TRUE)
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(Amelia)
+library(caret)
+library(corrplot)
+library(glmnet)
+library(gridExtra)
+library(caretEnsemble)
+library(leaps)
+library(BMA)
+library(randomForest)
+library(RWeka)
+library(fastAdaboost)
+library(class)
+library(RRF)
+library(pROC)
+```
+
+#### Read data
+```{r}
+# read data and perspective
+raw_data <- read_xlsx("Lunzmann-Cooke_data_20210124.xlsx", sheet = "data", col_names = TRUE)
+head(raw_data); dim(raw_data)
+```
+
+#### Some columns incorrectly converted to char() due to NA
+```{r}
+# correct the variables data type
+# Warning: note that NAs introduced by coercion
+raw_data <- raw_data %>% 
+                mutate(air.exposure = as.double(air.exposure)) %>%
+                mutate(hook.location = as.double(hook.location)) %>%
+                mutate(mean.fat = as.double(mean.fat))
+head(raw_data); dim(raw_data)
+```
+
+#### Check the missing data
+```{r}
+missmap(raw_data)
+```
+The number of missing data are relatively small. And since there is no reason to replace the missing values with the average, the median or the mode of the existing one, we would just discord these records.
+
+#### Removing all the NA's and Unknown's as missing data (40 in total)
+```{r}
+# remove the missing data
+complete_data <- raw_data %>% 
+                    filter(!is.na(air.exposure) & !is.na(hook.location) & !is.na(mean.fat) & 
+                            (tolower(population) != "unknown") & (tolower(sex) != "unknown") )
+head(complete_data); dim(complete_data)
+```
+
+#### Refine the data table (remove fish.no which is equivalent to tag.id)
+```{r}
+# remove fish.no column and check that tag.id is an unique identifier
+complete_data <- complete_data %>%
+                      select(-"fish.no")
+all(complete_data$tag.id == unique(complete_data$tag.id))
+head(complete_data); dim(complete_data)
+```
+
+#### Change the date to year
+```{r}
+complete_data <- complete_data %>%
+                      mutate(year=substr(date,1,4), .after=date)
+head(complete_data); dim(complete_data)
+```
+
+### Preliminary EDA
+
+#### Number of each detection.status
+```{r}
+complete_data %>% group_by(detection.status) %>% summarise(Count = n())
+# 96 of 241 not detected (mortality), 145 of 241 detected (survival)
+```
+
+14 predictors and 1 response variable
+
+#### Categorical predictors:
+year, population, sex, origin, hook.location, fin.damage, wound.score, scale.loss, eye.injury, bleed
+
+```{r}
+# define the functions used in visualization
+fraction <- function(Freq){
+  range = c(1:length(Freq))
+  for (i in range){
+    if ((i %% 2) != 0){
+      a = Freq[i]/(Freq[i]+Freq[i+1])
+      b = Freq[i+1]/(Freq[i]+Freq[i+1])
+      Freq[i]=a
+      Freq[i+1]=b
+    }
+  }
+  return(round(Freq,2))
+}
+bar_plot <- function(table, name_table){
+  colnames(name_table) <- c("not detected","detected")
+  row.names(table) <- c("not detected","detected")
+  namelist<-unlist(strsplit(names(dimnames(name_table))[1], "\\."))
+  if (length(namelist) ==1){
+    x_labs <- names(dimnames(name_table))[1]
+  } else {
+    x_labs <- paste(namelist[1],namelist[2], sep=" ")
+  }
+  ggplot(as.data.frame(table),aes(x=Var2,y=Freq,fill=Var1)) +
+      geom_bar(stat="identity",position="stack")+
+      xlab(x_labs) + ylab("Frequency") + labs(fill="detection status")+
+      geom_text(aes(label=fraction(Freq)),position="stack",vjust=1)+
+      scale_fill_manual(values=c("grey","light blue"))+
+      theme_bw()
+}
+```
+
+##### For year:
+```{r}
+# For year:
+# data summary: 88 in year 2020, 153 in year 153
+vs.year <- table(complete_data$year, complete_data$detection.status)
+names(dimnames(vs.year)) <- c("year", "detection.status")
+addmargins(vs.year)
+
+# data visualization:
+year_table <- table(complete_data$detection.status, complete_data$year)
+bar_plot(year_table, vs.year)
+```
+
+
+##### For population:
+```{r}
+# For population:
+vs.popu <- table(complete_data$population, complete_data$detection.status)
+names(dimnames(vs.popu)) <- c("population", "detection.status")
+addmargins(vs.popu)
+
+# data visualization:
+popu_table <- table(complete_data$detection.status, complete_data$population)
+bar_plot(popu_table, vs.popu)
+```
+
+
+##### For sex:
+```{r}
+# For sex:
+vs.sex <- table(complete_data$sex, complete_data$detection.status)
+names(dimnames(vs.sex)) <- c("sex", "detection.status")
+addmargins(vs.sex)
+
+# data visualization:
+sex_table <- table(complete_data$detection.status, complete_data$sex)
+bar_plot(sex_table, vs.sex)
+```
+
+
+##### For origin:
+```{r}
+# For origin:
+vs.origin <- table(complete_data$origin, complete_data$detection.status)
+names(dimnames(vs.origin)) <- c("origin", "detection.status")
+addmargins(vs.origin)
+
+# data visualization:
+origin_table <- table(complete_data$detection.status, complete_data$origin)
+bar_plot(origin_table, vs.origin)
+```
+
+
+##### For hook.location:
+```{r}
+# For hook.location:
+vs.hook <- table(complete_data$hook.location, complete_data$detection.status)
+names(dimnames(vs.hook)) <- c("hook.location", "detection.status")
+addmargins(vs.hook)
+
+# data visualization:
+hook_table <- table(complete_data$detection.status, complete_data$hook.location)
+bar_plot(hook_table, vs.hook)
+```
+
+
+##### For fin.damage:
+```{r}
+# For fin.damage:
+vs.fin_damage <- table(complete_data$fin.damage, complete_data$detection.status)
+names(dimnames(vs.fin_damage)) <- c("fin.damage", "detection.status")
+addmargins(vs.fin_damage)
+
+# data visualization:
+fin_table <- table(complete_data$detection.status, complete_data$fin.damage)
+bar_plot(fin_table, vs.fin_damage)
+```
+
+
+##### For wound.score:
+```{r}
+# For wound.score:
+vs.wound <- table(complete_data$wound.score, complete_data$detection.status)
+names(dimnames(vs.wound)) <- c("wound.score", "detection.status")
+addmargins(vs.wound)
+
+# data visualization:
+wound_table <- table(complete_data$detection.status, complete_data$wound.score)
+bar_plot(wound_table, vs.wound)
+```
+
+
+###### For scale.loss:
+```{r}
+# For scale.loss:
+vs.scale <- table(complete_data$scale.loss, complete_data$detection.status)
+names(dimnames(vs.scale)) <- c("scale.loss", "detection.status")
+addmargins(vs.scale)
+
+# data visualization:
+scale_table <- table(complete_data$detection.status, complete_data$scale.loss)
+bar_plot(scale_table, vs.scale)
+```
+
+
+###### For eye.injury:
+```{r}
+# For eye.injury:
+vs.eye <- table(complete_data$eye.injury, complete_data$detection.status)
+names(dimnames(vs.eye)) <- c("eye.injury", "detection.status")
+addmargins(vs.eye)
+
+# data visualization:
+eye.injury_table <- table(complete_data$detection.status, complete_data$eye.injury)
+bar_plot(eye.injury_table, vs.eye)
+```
+
+
+###### For bleed:
+```{r}
+# For bleed:
+vs.bleed <- table(complete_data$bleed, complete_data$detection.status)
+names(dimnames(vs.bleed)) <- c("bleed", "detection.status")
+addmargins(vs.bleed)
+
+# data visualization:
+bleed_table <- table(complete_data$detection.status, complete_data$bleed)
+bar_plot(bleed_table, vs.bleed)
+```
+
+
+#### Continuous predictors:
+length, air.exposure, reflex.score, mean.fat
+
+##### For length:
+```{r}
+# For length:
+# data summary:
+summary(complete_data$length)
+
+# data visualization:
+plot(complete_data$length, complete_data$detection.status)
+boxplot(length~detection.status, data=complete_data, horizontal=TRUE)
+```
+
+##### For air.exposure:
+```{r}
+# For air.exposure:
+# data summary:
+summary(complete_data$air.exposure)
+
+# data visualization:
+plot(complete_data$air.exposure, complete_data$detection.status)
+boxplot(air.exposure~detection.status, data=complete_data, horizontal=TRUE)
+```
+
+
+##### For reflex.score:
+```{r}
+# For reflex.score:
+# data summary:
+summary(complete_data$reflex.score)
+
+# data visualization:
+plot(complete_data$reflex.score, complete_data$detection.status)
+boxplot(reflex.score~detection.status, data=complete_data, horizontal=TRUE)
+```
+
+
+##### For mean.fat:
+```{r}
+# For mean.fat:
+# data summary:
+summary(complete_data$mean.fat)
+
+# data visualization:
+plot(complete_data$mean.fat, complete_data$detection.status)
+boxplot(mean.fat~detection.status, data=complete_data, horizontal=TRUE)
+```
+
+
+#### Correlation matrix
+```{r}
+## For correlation and plot correlation matrix
+complete_data_1 <- complete_data %>%
+                    mutate(year = ifelse(year == 2020,0,1)) %>% 
+                    mutate(sex = ifelse(sex == "male",0,1)) %>%
+                    mutate(origin = ifelse(origin == "w", 0, 1))
+
+complete_data_1 <- complete_data_1 %>%
+                    mutate(population = case_when(population == "BB" ~ 1, population == "ECVI" ~2, 
+                                                  population == "FR" ~ 3,
+                                     population == "HB" ~ 4, population == "PS" ~ 5))
+
+correlation <- cor(complete_data_1[,3:17]) # involve the response variable
+#correlation <- cor(complete_data_1[,3:16])
+
+corrplot::corrplot(correlation, tl.cex = 0.75)
+```
+
+
+### Model fitting
+
+#### Factor the categorical variables
+```{r}
+## Factor
+fit_dataset<-complete_data %>% 
+                  mutate(year=as.factor(year)) %>% 
+                  mutate(population=as.factor(population)) %>% 
+                  mutate(sex=as.factor(sex)) %>%
+                  mutate(origin=as.factor(origin)) %>%
+                  mutate(hook.location=as.factor(hook.location)) %>%
+                  mutate(fin.damage=as.factor(fin.damage)) %>%
+                  mutate(wound.score=as.factor(wound.score)) %>%
+                  mutate(scale.loss=as.factor(scale.loss)) %>%
+                  mutate(eye.injury=as.factor(eye.injury)) %>%
+                  mutate(bleed=as.factor(bleed)) %>%
+                  mutate(detection.status=as.factor(detection.status)) %>%
+                  #mutate(air.exposure=as.factor(air.exposure)) %>%
+                  select(-"tag.id") %>%
+                  select(-"date")
+
+str(fit_dataset)
+```
+
+_some problems: whether to set air.exposure and reflex.score as categorical variables, whether to standardize the continuous variables_
+
+
+#### Split into training dataset and testing dataset (4:1) proportional to detection.status
+```{r}
+# Sample from detected:
+
+detected <- fit_dataset %>% filter(detection.status == 1)
+smp_size <- floor(0.75 * nrow(detected))
+set.seed(450)
+detected_train <- sample(seq_len(nrow(detected)), size = smp_size)
+
+train_det <- detected[detected_train, ]
+test_det <- detected[-detected_train, ]
+
+# Sample from notdetected:
+notdetected <- fit_dataset %>% filter(detection.status == 0)
+smp_size <- floor(0.75 * nrow(notdetected))
+set.seed(451)
+notdetected_train <- sample(seq_len(nrow(notdetected)), size = smp_size)
+
+train_notdet <- notdetected[notdetected_train, ]
+test_notdet <- notdetected[-notdetected_train, ]
+
+# Combine detected and notdetected
+train <- rbind(train_det, train_notdet)
+test <- rbind(test_det, test_notdet)
+
+# Shuffle the rows
+#set.seed(452)
+rows_train <- sample(nrow(train))
+train <- train[rows_train, ]
+
+#set.seed(453)
+rows_test <- sample(nrow(test))
+test <- test[rows_test, ]
+```
+
+
+
+
+#### Fit logistic regression using training data (full_model, forwards, backwards, and their AIC)
+#### And check the training and testing accuracy (classification accuracy with different decision boundary)
+
+#### Full model
+```{r}
+# The full model
+fullmodel <- glm(detection.status~.,family=binomial(link='logit'),data=train)
+summary(fullmodel)
+```
+AIC = 227.49
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.fullmodel <- predict(fullmodel,newdata=subset(train,select=seq(1,14)),type='response')
+  train.fullmodel <- ifelse(train.fullmodel > 0.1*k,1,0)
+  misClasificError <- mean(train.fullmodel != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.fullmodel <- predict(fullmodel,newdata=subset(test,select=seq(1,14)),type='response')
+  test.fullmodel <- ifelse(test.fullmodel > 0.1*k,1,0)
+  misClasificError <- mean(test.fullmodel != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Backward Selection
+```{r}
+# Backward Selection
+backwards = stats::step(fullmodel)
+summary(backwards)
+formula(backwards)
+```
+AIC = 213.02
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.backmodel <- predict(backwards,newdata=subset(train,select=seq(1,14)),type='response')
+  train.backmodel <- ifelse(train.backmodel > 0.1*k,1,0)
+  misClasificError <- mean(train.backmodel != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.backmodel <- predict(backwards,newdata=subset(test,select=seq(1,14)),type='response')
+  test.backmodel <- ifelse(test.backmodel > 0.1*k,1,0)
+  misClasificError <- mean(test.backmodel != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Forward Selection
+
+```{r}
+# Forward Selection
+basemodel <- glm(detection.status~NULL, family=binomial(link='logit'),data=train);
+forwards <- stats::step(basemodel,scope=list(lower=formula(basemodel),upper=formula(fullmodel)), direction="forward");
+summary(forwards)
+formula(forwards)
+```
+AIC = 213.02
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.foremodel <- predict(forwards,newdata=subset(train,select=seq(1,14)),type='response')
+  train.foremodel <- ifelse(train.foremodel > 0.1*k,1,0)
+  misClasificError <- mean(train.foremodel != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.foremodel <- predict(forwards,newdata=subset(test,select=seq(1,14)),type='response')
+  test.foremodel <- ifelse(test.foremodel > 0.1*k,1,0)
+  misClasificError <- mean(test.foremodel != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Statistical Significant Predictors
+
+```{r}
+# Variable selection according to test
+anova(fullmodel, test="Chisq")
+sel_model <- glm(detection.status~eye.injury+hook.location+scale.loss+reflex.score+fin.damage+air.exposure, family=binomial(link='logit'),data=train);
+summary(sel_model)
+formula(sel_model)
+```
+AIC = 220.64
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.sel_model <- predict(sel_model,newdata=subset(train,select=seq(1,14)),type='response')
+  train.sel_model <- ifelse(train.sel_model > 0.1*k,1,0)
+  misClasificError <- mean(train.sel_model != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.sel_model <- predict(sel_model,newdata=subset(test,select=seq(1,14)),type='response')
+  test.sel_model <- ifelse(test.sel_model > 0.1*k,1,0)
+  misClasificError <- mean(test.sel_model != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+#### Statistical Significant Predictors removing scale loss
+
+```{r}
+# Variable selection according to test
+anova(fullmodel, test="Chisq")
+sel_model <- glm(detection.status~eye.injury+hook.location+reflex.score+fin.damage+air.exposure, family=binomial(link='logit'),data=train);
+summary(sel_model)
+formula(sel_model)
+```
+AIC = 218.45
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.sel_model <- predict(sel_model,newdata=subset(train,select=seq(1,14)),type='response')
+  train.sel_model <- ifelse(train.sel_model > 0.1*k,1,0)
+  misClasificError <- mean(train.sel_model != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.sel_model <- predict(sel_model,newdata=subset(test,select=seq(1,14)),type='response')
+  test.sel_model <- ifelse(test.sel_model > 0.1*k,1,0)
+  misClasificError <- mean(test.sel_model != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+
+#### Lasso
+
+```{r}
+# Lasso
+x <- model.matrix(detection.status~., train)[,-1];
+y <- ifelse(train$detection.status == "1", 1, 0);
+cv.lasso <- cv.glmnet(x, y, alpha = 1, family = "binomial"(link='logit'))
+lasso.model <- glmnet(x, y, alpha = 1, family = "binomial"(link='logit'), lambda = cv.lasso$lambda.min)
+coef(lasso.model)
+summary(lasso.model)
+```
+
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  x.train <- model.matrix(detection.status ~., train)[,-1]
+  probabilities <- lasso.model %>% predict(newx = x.train)
+  predicted.classes <- ifelse(probabilities > 0.1*k, 1, 0)
+  observed.classes <- train$detection.status
+  misClasificError <- mean(predicted.classes != observed.classes)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  x.test <- model.matrix(detection.status ~., test)[,-1]
+  probabilities <- lasso.model %>% predict(newx = x.test)
+  predicted.classes <- ifelse(probabilities > 0.1*k, 1, 0)
+  observed.classes <- test$detection.status
+  misClasificError <- mean(predicted.classes != observed.classes)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Custom Model
+
+```{r}
+# Custom model
+custom_model <- glm(detection.status~eye.injury+hook.location+fin.damage+reflex.score, family=binomial(link='logit'),data=train); # add reflex.score or not, does not affect the accuracy
+summary(custom_model)
+formula(custom_model)
+```
+AIC = 218.45
+
+Tried to factor air.exposure, it leads to higher training accuracy and lower testing accuracy (overfitting?).
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.custom_model <- predict(custom_model,newdata=subset(train,select=seq(1,14)),type='response')
+  train.custom_model <- ifelse(train.custom_model > 0.1*k,1,0)
+  misClasificError <- mean(train.custom_model != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.custom_model <- predict(custom_model,newdata=subset(test,select=seq(1,14)),type='response')
+  test.custom_model <- ifelse(test.custom_model > 0.1*k,1,0)
+  misClasificError <- mean(test.custom_model != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Try Confusion Matrix
+
+##### For training data
+```{r}
+threshold <- 0.5
+
+confusion.train <- 
+    train %>% 
+    dplyr::mutate(phat = predict(custom_model,newdata=subset(train,select=seq(1,14)),type='response'),
+                 prediction = ifelse(phat > threshold,1,0)) %>% 
+    dplyr::select(detection.status, prediction, phat)
+
+caret::confusionMatrix(factor(confusion.train$prediction), factor(confusion.train$detection.status))
+```
+
+```{r}
+incorrect.trainpred<-confusion.train$detection.status!=confusion.train$prediction
+train.incorrect <- train[which(incorrect.trainpred),]
+```
+
+
+
+
+##### For testing data
+```{r}
+threshold <- 0.4
+
+confusion.test <- 
+    test %>% 
+    dplyr::mutate(phat = predict(custom_model,newdata=subset(test,select=seq(1,14)),type='response'),
+                 prediction = ifelse(phat > threshold,1,0)) %>% 
+    dplyr::select(detection.status, prediction, phat)
+
+caret::confusionMatrix(factor(confusion.test$prediction), factor(confusion.test$detection.status))
+```
+
+```{r}
+incorrect.testpred<-confusion.test$detection.status!=confusion.test$prediction
+test.incorrect <- test[which(incorrect.testpred),]
+```
+
+
+
+======================================================================================
+
+log:
+1. detection.status~eye.injury+hook.location+fin.damage+reflex.score: factored or not reflex.score, overfitting
+2. detection.status~eye.injury+hook.location+fin.damage+reflex.score+year: overfitting
+3. detection.status~eye.injury+hook.location+fin.damage
+   detection.status~eye.injury+hook.location+fin.damage+air.exposure      have the same accuracy
+
+======================================================================================
+
+
+#### As a last step, we are going to plot the ROC curve and calculate the AUC (area under the curve) which are typical performance measurements for a binary classifier.
+The ROC is a curve generated by plotting the true positive rate (TPR) against the false positive rate (FPR) at various threshold settings while the AUC is the area under the ROC curve. As a rule of thumb, a model with good predictive ability should have an AUC closer to 1 (1 is ideal) than to 0.5.
+
+
+#### Plot ROC and calculate AUC
+```{r}
+ROC<-roc(confusion.train$detection.status, confusion.train$phat)
+plot(ROC, col="blue", print.auc=TRUE)
+```
+
+
+
+
+#### Subset Selection (Best Subset)
+
+```{r}
+# Best Subset Selection
+regfit.full = regsubsets(detection.status ~ ., data = train, nvmax = 31)
+(reg.summary = summary(regfit.full))
+```
+
+```{r}
+# Plot RSS, adjusted r-square, Cp, BIC for all the models at once
+par(mfrow = c(2, 2))
+# RSS Plot
+plot(reg.summary$rss, xlab = "Number of Variables", ylab = "RSS", type = "l")
+# Adjusted RSq plot
+plot(reg.summary$adjr2, xlab = "Number of Variables", ylab = "Adjusted RSq", type = "l")
+# Cp plot
+plot(reg.summary$cp, xlab = "Number of Variables", ylab = "Cp", type = "l")
+# BIC plot
+plot(reg.summary$bic, xlab = "Number of Variables", ylab = "BIC", type = "l")
+
+which.min(reg.summary$rss)
+which.max(reg.summary$adjr2)
+which.min(reg.summary$cp)
+which.min(reg.summary$bic)
+```
+
+
+#### Subset Selection (Forward)
+```{r}
+# Forward Selection
+regfit.forward = regsubsets(detection.status ~ ., data = train, nvmax = 31, method = "forward")
+(forward.summary = summary(regfit.forward))
+```
+
+```{r}
+# Plot RSS, adjusted r-square, Cp, BIC for all the models at once
+par(mfrow = c(2, 2))
+# RSS Plot
+plot(forward.summary$rss, xlab = "Number of Variables", ylab = "RSS", type = "l")
+# Adjusted RSq plot
+plot(forward.summary$adjr2, xlab = "Number of Variables", ylab = "Adjusted RSq", type = "l")
+# Cp plot
+plot(forward.summary$cp, xlab = "Number of Variables", ylab = "Cp", type = "l")
+# BIC plot
+plot(forward.summary$bic, xlab = "Number of Variables", ylab = "BIC", type = "l")
+
+which.min(forward.summary$rss)
+which.max(forward.summary$adjr2)
+which.min(forward.summary$cp)
+which.min(forward.summary$bic)
+```
+Seems not work. still use AIC (or test accuracy)
+
+
+=============================================================================================================
+
+
+```{r}
+# Cross-validation setting
+train_control_cv <- trainControl(method = "cv", number = 5) # 5-fold cross validation
+
+# Models to train
+# Generalized Linear Model (method = 'glm')
+# k-Nearest Neighbors (method = 'knn')
+# Linear Discriminant Analysis (method = 'lda')
+# Random Forest (method = 'rf')
+# Regularized Random Forest (method = 'RRF')
+# Stochastic Gradient Boosting (method = 'gbm')
+# Neural Network (method = 'nnet')
+# glmnet (method = 'glmnet')
+# Regularized Logistic Regression (method = 'regLogistic')
+# Support Vector Machines with Linear Kernel (method = 'svmLinear')
+# Support Vector Machines with Radial Basis Function Kernel (method = 'svmRadial')
+## 'lm', 'lasso','ridge' only for linear model, not suitable here
+
+method_list <- c('glm', 'knn', 'lda', 'rf', 'RRF', 'gbm', 'nnet',
+                 'glmnet', 'regLogistic', 'svmLinear', 'svmRadial') 
+#method_list <- c('glm', 'rf')
+models <- caretList(detection.status ~ ., data = train, methodList = method_list, trControl = train_control_cv)
+
+results <- resamples(models)
+```
+
+
+```{r}
+scales = list(x=list(relation='free'), y=list(relation='free'))
+bwplot(results,scales = scales,layout = c(2,2))
+```
+Not so much useful
+
+
+
+
+##### Try BIC model selection
+
+```{r}
+# Custom model
+bic_model <- bic.glm(detection.status~., glm.family=binomial(link='logit'),data=train);
+summary(bic_model)
+formula(bic_model)
+```
+Seems not working
+
+
+
+
+##### Full model with k-fold cross validation
+
+k-fold cv does not work on the given data. there is some badly imbalanced categorical predictors, for example, hook.location has level 3 with only one record, which cannot be used in testing data. So, at least one fold cannot be used.
+
+```{r}
+# split the training data into five parts
+partition <- 180/5 # =36
+folds <- c(1:36, 37:72, 73:108, 109:144, 145:180)
+
+# Cross-Validation
+range.fold <- c(1,2,3,4,5)
+fold_acc <- c(1,2,3,4,5)
+train_acc <- c(1,2,3,4,5)
+for (k in range.fold){
+  train.data <- train[-((36*(k-1)+1):(36*k)),]
+  train.model <- glm(detection.status~.,
+                      family=binomial(link='logit'),data=train.data)
+  
+  # calculate validation accuracy:
+  
+  # check the categorical variables levels in validation data
+  # remove the 'new' levels in validation data
+  valid.variables <- train[(36*(k-1)+1):(36*k),1:14]
+  valid.data <- train[(36*(k-1)+1):(36*k),]
+  for (var in variable.names(train.data)){
+    train.var <- pull(train.data[var])
+    if (is.factor(train.var)){
+      train.levels <- unique(train.var)
+      valid.var <- pull(valid.data[var])
+      valid.levels <- unique(valid.var)
+      if (!(all(valid.levels %in% train.levels))){
+        # find the new level(s) in valid but not in train
+        new.levels <- valid.levels[!(valid.levels %in% train.levels)]
+        valid.variables <- valid.variables[which(valid.var %in% train.levels),]
+        valid.data <- valid.data[which(valid.var %in% train.levels),]
+      }
+    }
+  }
+  
+  
+  range.decision_boundary <- c(0,1,2,3,4,5,6,7,8,9,10)
+  accs <- c(0,1,2,3,4,5,6,7,8,9,10)
+  for (i in range.decision_boundary){
+    # training accuracy for different decision boundaries:
+    valid.model <- predict(train.model,newdata=train.data, type='response')
+    valid.model <- ifelse(valid.model > 0.1*i,1,0)
+    misClasificError <- mean(valid.model != train.data$detection.status)
+    accs[i+1] <- 1-misClasificError
+  }
+  # selection the max accuracy
+  train_acc[k] <- max(accs)
+  best_bound <- which.max(accs)
+  
+  
+  
+  
+  accss <- c(1,2,3)
+  # compute the validation accuracy
+  valid.model <- predict(train.model,newdata=valid.variables, type='response')
+  valid.model <- ifelse(valid.model > 0.1*(best_bound-1),1,0)
+  misClasificError <- mean(valid.model != valid.data$detection.status)
+  accss[1] <- 1-misClasificError
+  
+  valid.model <- predict(train.model,newdata=valid.variables, type='response')
+  valid.model <- ifelse(valid.model > 0.1*best_bound,1,0)
+  misClasificError <- mean(valid.model != valid.data$detection.status)
+  accss[2] <- 1-misClasificError
+  
+  valid.model <- predict(train.model,newdata=valid.variables, type='response')
+  valid.model <- ifelse(valid.model > 0.1*(best_bound+1),1,0)
+  misClasificError <- mean(valid.model != valid.data$detection.status)
+  accss[3] <- 1-misClasificError
+  
+  fold_acc[k] <- max(accss)
+}
+# calculate the mean of the max accuracies for the folds
+acccuracy_train <- mean(train_acc)
+acccuracy_cv <- mean(fold_acc)
+# outputs
+train_acc; acccuracy_train
+fold_acc; acccuracy_cv
+```
+
+
+##### Stepwise regression model with k-fold cross validation
+
+k-fold cv does not work on the given data. there is some badly imbalanced categorical predictors, for example, hook.location has level 3 with only one record, which cannot be used in testing data. So, at least one fold cannot be used.
+
+```{r}
+# split the training data into five parts
+partition <- 180/5 # =36
+folds <- c(1:36, 37:72, 73:108, 109:144, 145:180)
+
+# Cross-Validation
+range.fold <- c(1,2,3,4,5)
+fold_acc <- c(1,2,3,4,5)
+train_acc <- c(1,2,3,4,5)
+for (k in range.fold){
+  train.data <- train[-((36*(k-1)+1):(36*k)),]
+  train.model <- glm(detection.status~year + origin + air.exposure + hook.location + 
+                       fin.damage + scale.loss + eye.injury + reflex.score,
+                      family=binomial(link='logit'),data=train.data)
+  
+  # calculate validation accuracy:
+  
+  # check the categorical variables levels in validation data
+  # remove the 'new' levels in validation data
+  valid.variables <- train[(36*(k-1)+1):(36*k),1:14]
+  valid.data <- train[(36*(k-1)+1):(36*k),]
+  for (var in variable.names(train.data)){
+    train.var <- pull(train.data[var])
+    if (is.factor(train.var)){
+      train.levels <- unique(train.var)
+      valid.var <- pull(valid.data[var])
+      valid.levels <- unique(valid.var)
+      if (!(all(valid.levels %in% train.levels))){
+        # find the new level(s) in valid but not in train
+        new.levels <- valid.levels[!(valid.levels %in% train.levels)]
+        valid.variables <- valid.variables[which(valid.var %in% train.levels),]
+        valid.data <- valid.data[which(valid.var %in% train.levels),]
+      }
+    }
+  }
+  
+  
+  range.decision_boundary <- c(0,1,2,3,4,5,6,7,8,9,10)
+  accs <- c(0,1,2,3,4,5,6,7,8,9,10)
+  for (i in range.decision_boundary){
+    # training accuracy for different decision boundaries:
+    valid.model <- predict(train.model,newdata=train.data, type='response')
+    valid.model <- ifelse(valid.model > 0.1*i,1,0)
+    misClasificError <- mean(valid.model != train.data$detection.status)
+    accs[i+1] <- 1-misClasificError
+  }
+  # selection the max accuracy
+  train_acc[k] <- max(accs)
+  best_bound <- which.max(accs)
+  
+
+  
+  # compute the validation accuracy
+  valid.model <- predict(train.model,newdata=valid.variables, type='response')
+  valid.model <- ifelse(valid.model > 0.1*best_bound,1,0)
+  misClasificError <- mean(valid.model != valid.data$detection.status)
+  fold_acc[k] <- 1-misClasificError
+}
+# calculate the mean of the max accuracies for the folds
+acccuracy_train <- mean(train_acc)
+acccuracy_cv <- mean(fold_acc)
+# outputs
+train_acc; acccuracy_train
+fold_acc; acccuracy_cv
+```
+
+##### significance model with k-fold cross validation
+
+k-fold cv does not work on the given data. there is some badly imbalanced categorical predictors, for example, hook.location has level 3 with only one record, which cannot be used in testing data. So, at least one fold cannot be used.
+
+```{r}
+# split the training data into five parts
+partition <- 180/5 # =36
+folds <- c(1:36, 37:72, 73:108, 109:144, 145:180)
+
+# Cross-Validation
+range.fold <- c(1,2,3,4,5)
+fold_acc <- c(1,2,3,4,5)
+train_acc <- c(1,2,3,4,5)
+for (k in range.fold){
+  train.data <- train[-((36*(k-1)+1):(36*k)),]
+  train.model <- glm(detection.status~air.exposure + hook.location + fin.damage 
+                     + scale.loss + eye.injury + reflex.score,
+                      family=binomial(link='logit'),data=train.data)
+  
+  # calculate validation accuracy:
+  
+  # check the categorical variables levels in validation data
+  # remove the 'new' levels in validation data
+  valid.variables <- train[(36*(k-1)+1):(36*k),1:14]
+  valid.data <- train[(36*(k-1)+1):(36*k),]
+  for (var in variable.names(train.data)){
+    train.var <- pull(train.data[var])
+    if (is.factor(train.var)){
+      train.levels <- unique(train.var)
+      valid.var <- pull(valid.data[var])
+      valid.levels <- unique(valid.var)
+      if (!(all(valid.levels %in% train.levels))){
+        # find the new level(s) in valid but not in train
+        new.levels <- valid.levels[!(valid.levels %in% train.levels)]
+        valid.variables <- valid.variables[which(valid.var %in% train.levels),]
+        valid.data <- valid.data[which(valid.var %in% train.levels),]
+      }
+    }
+  }
+  
+  
+  range.decision_boundary <- c(0,1,2,3,4,5,6,7,8,9,10)
+  accs <- c(0,1,2,3,4,5,6,7,8,9,10)
+  for (i in range.decision_boundary){
+    # training accuracy for different decision boundaries:
+    valid.model <- predict(train.model,newdata=train.data, type='response')
+    valid.model <- ifelse(valid.model > 0.1*i,1,0)
+    misClasificError <- mean(valid.model != train.data$detection.status)
+    accs[i+1] <- 1-misClasificError
+  }
+  # selection the max accuracy
+  train_acc[k] <- max(accs)
+  best_bound <- which.max(accs)
+  
+
+  
+  
+  # compute the validation accuracy
+  accss <- c(1,2,3)
+  for (i in accss){
+    valid.model <- predict(train.model,newdata=valid.variables, type='response')
+    valid.model <- ifelse(valid.model > 0.1*(best_bound-2+i),1,0)
+    misClasificError <- mean(valid.model != valid.data$detection.status)
+    accss[i] <- 1-misClasificError
+  }
+  fold_acc[k] <- max(accss)
+}
+# calculate the mean of the max accuracies for the folds
+acccuracy_train <- mean(train_acc)
+acccuracy_cv <- mean(fold_acc)
+# outputs
+train_acc; acccuracy_train
+fold_acc; acccuracy_cv
+```
+
+
+
+##### Custom model with k-fold cross validation
+
+k-fold cv does not work on the given data. there is some badly imbalanced categorical predictors, for example, hook.location has level 3 with only one record, which cannot be used in testing data. So, at least one fold cannot be used.
+
+```{r}
+# split the training data into five parts
+partition <- 180/5 # =36
+folds <- c(1:36, 37:72, 73:108, 109:144, 145:180)
+
+# Cross-Validation
+range.fold <- c(1,2,3,4,5)
+fold_acc <- c(1,2,3,4,5)
+for (k in range.fold){
+  train.data <- train[-((36*(k-1)+1):(36*k)),]
+  train.model <- glm(detection.status~eye.injury+hook.location+fin.damage+reflex.score+air.exposure,
+                      family=binomial(link='logit'),data=train.data)
+  
+  # calculate validation accuracy:
+  
+  # check the categorical variables levels in validation data
+  # remove the 'new' levels in validation data
+  valid.variables <- train[(36*(k-1)+1):(36*k),1:14]
+  valid.data <- train[(36*(k-1)+1):(36*k),]
+  for (var in variable.names(train.data)){
+    train.var <- pull(train.data[var])
+    if (is.factor(train.var)){
+      train.levels <- unique(train.var)
+      valid.var <- pull(valid.data[var])
+      valid.levels <- unique(valid.var)
+      if (!(all(valid.levels %in% train.levels))){
+        # find the new level(s) in valid but not in train
+        new.levels <- valid.levels[!(valid.levels %in% train.levels)]
+        valid.variables <- valid.variables[which(valid.var %in% train.levels),]
+        valid.data <- valid.data[which(valid.var %in% train.levels),]
+      }
+    }
+  }
+
+  
+  
+  range.decision_boundary <- c(0,1,2,3,4,5,6,7,8,9,10)
+  accs <- c(0,1,2,3,4,5,6,7,8,9,10)
+  for (i in range.decision_boundary){
+    # training accuracy for different decision boundaries:
+    valid.model <- predict(train.model,newdata=train.data, type='response')
+    valid.model <- ifelse(valid.model > 0.1*i,1,0)
+    misClasificError <- mean(valid.model != train.data$detection.status)
+    accs[i+1] <- 1-misClasificError
+  }
+  # selection the max accuracy
+  train_acc[k] <- max(accs)
+  best_bound <- which.max(accs)
+  
+
+  
+  # compute the validation accuracy
+  accss <- c(1,2,3)
+  for (i in accss){
+    valid.model <- predict(train.model,newdata=valid.variables, type='response')
+    valid.model <- ifelse(valid.model > 0.1*(best_bound-2+i),1,0)
+    misClasificError <- mean(valid.model != valid.data$detection.status)
+    accss[i] <- 1-misClasificError
+  }
+  fold_acc[k] <- max(accss)
+}
+# calculate the mean of the max accuracies for the folds
+acccuracy_train <- mean(train_acc)
+acccuracy_cv <- mean(fold_acc)
+# outputs
+train_acc; acccuracy_train
+fold_acc; acccuracy_cv
+```
+
+
+
+
+##### Custom model removing air exposure with k-fold cross validation
+
+k-fold cv does not work on the given data. there is some badly imbalanced categorical predictors, for example, hook.location has level 3 with only one record, which cannot be used in testing data. So, at least one fold cannot be used.
+
+```{r}
+# split the training data into five parts
+partition <- 180/5 # =36
+folds <- c(1:36, 37:72, 73:108, 109:144, 145:180)
+
+# Cross-Validation
+range.fold <- c(1,2,3,4,5)
+fold_acc <- c(1,2,3,4,5)
+for (k in range.fold){
+  train.data <- train[-((36*(k-1)+1):(36*k)),]
+  train.model <- glm(detection.status~eye.injury+hook.location+fin.damage+reflex.score,
+                      family=binomial(link='logit'),data=train.data)
+  
+  # calculate validation accuracy:
+  
+  # check the categorical variables levels in validation data
+  # remove the 'new' levels in validation data
+  valid.variables <- train[(36*(k-1)+1):(36*k),1:14]
+  valid.data <- train[(36*(k-1)+1):(36*k),]
+  for (var in variable.names(train.data)){
+    train.var <- pull(train.data[var])
+    if (is.factor(train.var)){
+      train.levels <- unique(train.var)
+      valid.var <- pull(valid.data[var])
+      valid.levels <- unique(valid.var)
+      if (!(all(valid.levels %in% train.levels))){
+        # find the new level(s) in valid but not in train
+        new.levels <- valid.levels[!(valid.levels %in% train.levels)]
+        valid.variables <- valid.variables[which(valid.var %in% train.levels),]
+        valid.data <- valid.data[which(valid.var %in% train.levels),]
+      }
+    }
+  }
+
+  
+  
+  range.decision_boundary <- c(0,1,2,3,4,5,6,7,8,9,10)
+  accs <- c(0,1,2,3,4,5,6,7,8,9,10)
+  for (i in range.decision_boundary){
+    # training accuracy for different decision boundaries:
+    valid.model <- predict(train.model,newdata=train.data, type='response')
+    valid.model <- ifelse(valid.model > 0.1*i,1,0)
+    misClasificError <- mean(valid.model != train.data$detection.status)
+    accs[i+1] <- 1-misClasificError
+  }
+  # selection the max accuracy
+  train_acc[k] <- max(accs)
+  best_bound <- which.max(accs)
+  
+
+  
+  # compute the validation accuracy
+  accss <- c(1,2,3)
+  for (i in accss){
+    valid.model <- predict(train.model,newdata=valid.variables, type='response')
+    valid.model <- ifelse(valid.model > 0.1*(best_bound-2+i),1,0)
+    misClasificError <- mean(valid.model != valid.data$detection.status)
+    accss[i] <- 1-misClasificError
+  }
+  fold_acc[k] <- max(accss)
+}
+# calculate the mean of the max accuracies for the folds
+acccuracy_train <- mean(train_acc)
+acccuracy_cv <- mean(fold_acc)
+# outputs
+train_acc; acccuracy_train
+fold_acc; acccuracy_cv
+```
+
+
+
+
+
+
+
+#### Random Forest (with cross-validation)
+
+##### Random Forest with in-built function
+```{r}
+# Random Forest with in-built function
+trControl <- trainControl(method = "cv", number = 5)
+#no_hook_3 <- train[-136,]
+glm_default <- train(detection.status~eye.injury+hook.location+fin.damage+air.exposure+reflex.score, method = "rf", data=train, metric = "Accuracy", trControl = trControl)
+# Print the results
+print(glm_default)
+```
+
+
+
+
+##### Random Forest with self-designed 5-fold cross-validation
+
+```{r}
+# split the training data into five parts
+partition <- 180/5 # =36
+folds <- c(1:36, 37:72, 73:108, 109:144, 145:180)
+
+# Cross-Validation
+range.fold <- c(1,2,3,4,5)
+fold_acc <- c(1,2,3,4,5)
+for (k in range.fold){
+  train.data <- train[-((36*(k-1)+1):(36*k)),]
+  train.model <- randomForest(detection.status~., data = train.data, ntree = 1000, mtry = 2, importance = TRUE)
+  
+  # calculate validation accuracy:
+  
+  # check the categorical variables levels in validation data
+  # remove the 'new' levels in validation data
+  valid.variables <- train[(36*(k-1)+1):(36*k),1:14]
+  valid.data <- train[(36*(k-1)+1):(36*k),]
+  for (var in variable.names(train.data)){
+    train.var <- pull(train.data[var])
+    if (is.factor(train.var)){
+      train.levels <- unique(train.var)
+      valid.var <- pull(valid.data[var])
+      valid.levels <- unique(valid.var)
+      if (!(all(valid.levels %in% train.levels))){
+        # find the new level(s) in valid but not in train
+        new.levels <- valid.levels[!(valid.levels %in% train.levels)]
+        valid.variables <- valid.variables[which(valid.var %in% train.levels),]
+        valid.data <- valid.data[which(valid.var %in% train.levels),]
+      }
+    }
+  }
+  
+  # accuracy for one fold
+  rf_pred <- predict(train.model, valid.data, type = "class")
+  fold_acc[k] <- mean(rf_pred == valid.data$detection.status) 
+}
+# calculate the mean of the max accuracies for the folds
+acccuracy_cv <- mean(fold_acc)
+# outputs
+fold_acc; acccuracy_cv
+```
+
+
+
+##### Apply random forest model to test data
+
+```{r}
+rf_model <- randomForest(detection.status~eye.injury+hook.location+fin.damage+air.exposure+reflex.score, data = train, ntree = 1000, mtry = 2, importance = TRUE)
+rf_model
+```
+
+```{r}
+rftrain_pred <- predict(rf_model, train, type = "class")
+mean(rftrain_pred == train$detection.status) 
+table(rftrain_pred, train$detection.status)
+```
+The performance on training data is much better than all other models previously.
+
+```{r}
+rf_pred <- predict(rf_model, test, type = "class")
+mean(rf_pred == test$detection.status)
+table(rf_pred, test$detection.status)
+```
+
+The full model overfits.
+
+
+
+##### Logistic Model Trees
+
+```{r}
+trControl <- trainControl(method = "cv", number = 5)
+#no_hook_3 <- train[-136,]
+glm_default <- train(detection.status~eye.injury+hook.location+fin.damage+air.exposure+reflex.score, method = "LMT", data=train, metric = "Accuracy", trControl = trControl)
+# Print the results
+print(glm_default)
+```
+
+
+##### Apply LMT to test data
+
+```{r}
+lmt_model <- LMT(detection.status~eye.injury+hook.location+fin.damage+air.exposure+reflex.score, data = train)
+summary(lmt_model)
+```
+
+
+```{r}
+lmttrain_pred <- predict(lmt_model, train, type = "class")
+mean(lmttrain_pred == train$detection.status) 
+table(lmttrain_pred, train$detection.status)
+```
+
+
+```{r}
+lmt_pred <- predict(lmt_model, test, type = "class")
+mean(lmt_pred == test$detection.status) 
+table(lmt_pred, test$detection.status)
+```
+
+Full model and custom model give the same results
+
+
+
+
+
+
+#### RRF (Regularized Random Forest)
+
+#### RRF with cross-validation
+```{r}
+trControl <- trainControl(method = "cv", number = 5, search = "grid")
+
+rrf_default <- train(detection.status~., data = train, method = "RRF", metric = "Accuracy", trControl = trControl)
+# Print the results
+print(rrf_default)
+```
+
+
+
+##### Apply RRF to test data
+
+```{r}
+rrf_model <- RRF(detection.status ~ eye.injury+hook.location+fin.damage+air.exposure+reflex.score, train, ntree=1000, mtry=4, norm.votes=FALSE)
+rrf_model
+```
+
+
+```{r}
+rrftrain_pred <- predict(rrf_model, train, type = "class")
+mean(rrftrain_pred == train$detection.status) 
+table(rrftrain_pred, train$detection.status)
+```
+
+
+```{r}
+rrf_pred <- predict(rrf_model, test, type = "class")
+mean(rrf_pred == test$detection.status) 
+table(rrf_pred, test$detection.status)
+```
+
+Again, the full model overfits.
+
+
+
+
+
+
+
+#### KNN
+
+```{r}
+trControl <- trainControl(method = "cv", number = 5)
+
+knn_default <- train(detection.status~., data = train, method = "knn", metric = "Accuracy", trControl = trControl)
+# Print the results
+print(knn_default)
+```
+
+Need to convert factors (with various levels) into numerical data, and further standardize. Not actually suitable.
+
+
+
+
+
+
+
+
+#### NNET
+
+```{r}
+trControl <- trainControl(method = "cv", number = 5, search = "grid")
+
+knn_default <- train(detection.status~eye.injury+hook.location+fin.damage+air.exposure+reflex.score, data = train, method = "nnet", metric = "Accuracy", trControl = trControl)
+# Print the results
+print(knn_default)
+```
+
+Seems not working.
+
+
+
+
+
+
+
+
+#### Tuning parameters for RF, RRF
+
+
+```{r}
+rf_model <- randomForest(detection.status~eye.injury+hook.location+fin.damage+air.exposure+reflex.score, data = train, ntree = 1000, mtry = 2, importance = TRUE)
+rf_model
+```
+
+```{r}
+rftrain_pred <- predict(rf_model, train, type = "class")
+mean(rftrain_pred == train$detection.status) 
+table(rftrain_pred, train$detection.status)
+```
+
+```{r}
+rf_pred <- predict(rf_model, test, type = "class")
+mean(rf_pred == test$detection.status)
+table(rf_pred, test$detection.status)
+```
+
+```{r}
+mtry.options = c(1,2,3,4,5)
+train.accuracy = c(1,2,3,4,5)
+test.accuracy = c(1,2,3,4,5)
+for (mtry in mtry.options){
+  rf_model <- randomForest(detection.status~eye.injury+hook.location+fin.damage+air.exposure+reflex.score, data = train, ntree = 1000, mtry = mtry, importance = TRUE)
+  # train accuracy
+  rftrain_pred <- predict(rf_model, train, type = "class")
+  train.accuracy[mtry] <- mean(rftrain_pred == train$detection.status)
+  # test accuracy
+  rf_pred <- predict(rf_model, test, type = "class")
+  test.accuracy[mtry] <- mean(rf_pred == test$detection.status)
+}
+```
+
+```{r}
+plot(mtry.options, train.accuracy, col="blue", type="o", ylim=range(c(train.accuracy,test.accuracy)))
+points(mtry.options, test.accuracy, col="red", pch="*")
+lines(mtry.options, test.accuracy, col="red")
+```
+
+```{r}
+ntree.options = c(1,2,3,4,5,6,7,8,9,10)
+train.accuracy = c(1,2,3,4,5,6,7,8,9,10)
+test.accuracy = c(1,2,3,4,5,6,7,8,9,10)
+for (ntree in ntree.options){
+  rf_model <- randomForest(detection.status~eye.injury+reflex.score+hook.location+fin.damage+air.exposure, data = train, ntree = 100*ntree, mtry = 3, importance = TRUE)
+  # train accuracy
+  rftrain_pred <- predict(rf_model, train, type = "class")
+  train.accuracy[ntree] <- mean(rftrain_pred == train$detection.status)
+  # test accuracy
+  rf_pred <- predict(rf_model, test, type = "class")
+  test.accuracy[ntree] <- mean(rf_pred == test$detection.status)
+}
+```
+
+```{r}
+plot(ntree.options, train.accuracy, col="blue", type="o", ylim=range(c(train.accuracy,test.accuracy)))
+points(ntree.options, test.accuracy, col="red", pch="*")
+lines(ntree.options, test.accuracy, col="red")
+```
+
+```{r}
+mtry.options = c(1,2,3,4,5,6)
+train.accuracy = c(1,2,3,4,5,6)
+test.accuracy = c(1,2,3,4,5,6)
+for (mtry in mtry.options){
+  # detection.status~eye.injury+hook.location+fin.damage+reflex.score+air.exposure
+  rf_model <- randomForest(detection.status~eye.injury+reflex.score+hook.location+fin.damage+air.exposure, data = train, ntree = 1000, mtry = mtry, importance = TRUE)
+  # train accuracy
+  rftrain_pred <- predict(rf_model, train, type = "class")
+  train.accuracy[mtry] <- mean(rftrain_pred == train$detection.status)
+  # test accuracy
+  rf_pred <- predict(rf_model, test, type = "class")
+  test.accuracy[mtry] <- mean(rf_pred == test$detection.status)
+}
+```
+
+```{r}
+plot(mtry.options, train.accuracy, col="blue", type="o", ylim=range(c(train.accuracy,test.accuracy)))
+points(mtry.options, test.accuracy, col="red", pch="*")
+lines(mtry.options, test.accuracy, col="red")
+```
+
+
+
+
+
+
+
+
+
+
+## Analyze the updated data with separate variables
+
+## Condese to injury.score
+
+#### Read data
+```{r}
+# read data and perspective
+newraw_data <- read_xlsx("updated_data_sepearate_variables.xlsx", sheet = "data", col_names = TRUE)
+head(newraw_data); dim(newraw_data)
+```
+
+#### Some columns incorrectly converted to char() due to NA
+```{r}
+# correct the variables data type
+# Warning: note that NAs introduced by coercion
+newraw_data <- newraw_data %>% 
+                mutate(air.exposure = as.double(air.exposure)) %>%
+                mutate(hook.location = as.double(hook.location)) %>%
+                mutate(mean.fat = as.double(mean.fat))
+head(newraw_data); dim(newraw_data)
+```
+
+#### Removing all the NA's and Unknown's as missing data (40 in total)
+```{r}
+# remove the missing data
+new_complete_data <- newraw_data %>% 
+                    filter(!is.na(air.exposure) & !is.na(hook.location) & !is.na(mean.fat) & 
+                            (tolower(population) != "unknown") & (tolower(sex) != "unknown") )
+head(new_complete_data); dim(new_complete_data)
+```
+
+#### Refine the data table (remove fish.no which is equivalent to tag.id)
+```{r}
+# remove fish.no column and check that tag.id is an unique identifier
+new_complete_data <- new_complete_data %>%
+                      select(-"fish.no")
+all(new_complete_data$tag.id == unique(new_complete_data$tag.id))
+head(new_complete_data); dim(new_complete_data)
+```
+
+#### Change the date to year
+```{r}
+new_complete_data <- new_complete_data %>%
+                      mutate(year=substr(date,1,4), .after=date)
+head(new_complete_data); dim(new_complete_data)
+```
+
+#### Remove fin damage, wound score, scale loss, eye injury, and bleeding, VOR, tail.flex, body.flex, venting, orientation to analyze injury.score
+```{r}
+# remove fish.no column and check that tag.id is an unique identifier
+new_complete_data <- new_complete_data %>%
+                      select(-"fin.damage") %>% select(-"wound.score") %>% select(-"scale.loss") %>%
+                      select(-"eye.injury") %>% select(-"bleed") %>% select(-"VOR") %>%
+                      select(-"tail.flex") %>% select(-"body.flex") %>% select(-"venting") %>%
+                      select(-"orientation")
+all(new_complete_data$tag.id == unique(new_complete_data$tag.id))
+head(new_complete_data); dim(new_complete_data)
+```
+
+
+```{r}
+# For injury.score treat as categorical variable:
+vs.injury <- table(new_complete_data$injury.score, new_complete_data$detection.status)
+names(dimnames(vs.injury)) <- c("injury.score", "detection.status")
+addmargins(vs.injury)
+
+# data visualization:
+injury_table <- table(new_complete_data$detection.status, new_complete_data$injury.score)
+barplot(injury_table, xlab="injury.score", col=c("grey", "light blue"), legend = rownames(injury_table), beside=TRUE)
+
+# data visualization with fractions
+bar_plot <- function(injury_table){
+  ggplot(as.data.frame(injury_table),aes(x=Var2,y=Freq,fill=Var1)) +
+      geom_bar(stat="identity",position="stack")+
+      xlab("injury.score") + ylab("freq") + labs(fill="detection.status") +
+      geom_text(aes(label=fraction(Freq)),position="stack",vjust=1)+
+      scale_fill_manual(values=c("grey","light blue"))+
+      theme_bw()
+}
+bar_plot(injury_table)
+```
+
+
+### Model fitting
+
+#### Factor the categorical variables
+```{r}
+## Factor
+new_fit_dataset<-new_complete_data %>% 
+                  mutate(year=as.factor(year)) %>% 
+                  mutate(population=as.factor(population)) %>% 
+                  mutate(sex=as.factor(sex)) %>%
+                  mutate(origin=as.factor(origin)) %>%
+                  mutate(hook.location=as.factor(hook.location)) %>%
+                  mutate(injury.score=as.factor(injury.score)) %>%
+                  mutate(detection.status=as.factor(detection.status)) %>%
+                  #mutate(air.exposure=as.factor(air.exposure)) %>%
+                  select(-"tag.id") %>%
+                  select(-"date")
+
+str(new_fit_dataset)
+```
+
+
+#### Split into training dataset and testing dataset (4:1) proportional to detection.status
+```{r}
+# Sample from detected:
+
+new_detected <- new_fit_dataset %>% filter(detection.status == 1)
+smp_size <- floor(0.75 * nrow(new_detected))
+set.seed(450)
+new_detected_train <- sample(seq_len(nrow(new_detected)), size = smp_size)
+
+new_train_det <- new_detected[new_detected_train, ]
+new_test_det <- new_detected[-new_detected_train, ]
+
+# Sample from notdetected:
+new_notdetected <- new_fit_dataset %>% filter(detection.status == 0)
+smp_size <- floor(0.75 * nrow(new_notdetected))
+set.seed(451)
+new_notdetected_train <- sample(seq_len(nrow(new_notdetected)), size = smp_size)
+
+new_train_notdet <- new_notdetected[new_notdetected_train, ]
+new_test_notdet <- new_notdetected[-new_notdetected_train, ]
+
+# Combine detected and notdetected
+new_train <- rbind(new_train_det, new_train_notdet)
+new_test <- rbind(new_test_det, new_test_notdet)
+
+# Shuffle the rows
+#set.seed(452)
+new_rows_train <- sample(nrow(new_train))
+new_train <- new_train[new_rows_train, ]
+
+#set.seed(453)
+new_rows_test <- sample(nrow(new_test))
+new_test <- new_test[new_rows_test, ]
+```
+
+
+
+#### Full model
+```{r}
+# The full model
+new_fullmodel <- glm(detection.status~.,family=binomial(link='logit'),data=new_train)
+summary(new_fullmodel)
+```
+AIC = 227.49
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.new_fullmodel <- predict(new_fullmodel,newdata=subset(new_train,select=seq(1,10)),type='response')
+  train.new_fullmodel <- ifelse(train.new_fullmodel > 0.1*k,1,0)
+  misClasificError <- mean(train.new_fullmodel != new_train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.new_fullmodel <- predict(new_fullmodel,newdata=subset(new_test,select=seq(1,10)),type='response')
+  test.new_fullmodel <- ifelse(test.new_fullmodel > 0.1*k,1,0)
+  misClasificError <- mean(test.new_fullmodel != new_test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+#### Backward Selection
+```{r}
+# Backward Selection
+new_backwards = stats::step(new_fullmodel)
+summary(new_backwards)
+formula(new_backwards)
+```
+AIC = 213.02
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.new_backmodel <- predict(new_backwards,newdata=subset(new_train,select=seq(1,10)),type='response')
+  train.new_backmodel <- ifelse(train.new_backmodel > 0.1*k,1,0)
+  misClasificError <- mean(train.new_backmodel != new_train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.new_backmodel <- predict(new_backwards,newdata=subset(new_test,select=seq(1,10)),type='response')
+  test.new_backmodel <- ifelse(test.new_backmodel > 0.1*k,1,0)
+  misClasificError <- mean(test.new_backmodel != new_test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+#### Forward Selection
+
+```{r}
+# Forward Selection
+new_basemodel <- glm(detection.status~NULL, family=binomial(link='logit'),data=new_train);
+new_forwards <- stats::step(new_basemodel,scope=list(lower=formula(new_basemodel),upper=formula(new_fullmodel)), direction="forward");
+summary(new_forwards)
+formula(new_forwards)
+```
+AIC = 213.02
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.foremodel <- predict(new_forwards,newdata=subset(new_train,select=seq(1,10)),type='response')
+  train.foremodel <- ifelse(train.foremodel > 0.1*k,1,0)
+  misClasificError <- mean(train.foremodel != new_train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.new_foremodel <- predict(new_forwards,newdata=subset(new_test,select=seq(1,10)),type='response')
+  test.new_foremodel <- ifelse(test.new_foremodel > 0.1*k,1,0)
+  misClasificError <- mean(test.new_foremodel != new_test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+#### Custom Model
+
+```{r}
+# Custom model
+new_custom_model <- glm(detection.status~hook.location+injury.score+reflex.score, family=binomial(link='logit'),data=new_train); # add reflex.score or not, does not affect the accuracy
+summary(new_custom_model)
+formula(new_custom_model)
+```
+AIC = 218.45
+
+Tried to factor air.exposure, it leads to higher training accuracy and lower testing accuracy (overfitting?).
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.new_custom_model <- predict(new_custom_model,newdata=subset(new_train,select=seq(1,10)),type='response')
+  train.new_custom_model <- ifelse(train.new_custom_model > 0.1*k,1,0)
+  misClasificError <- mean(train.new_custom_model != new_train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.new_custom_model <- predict(new_custom_model,newdata=subset(new_test,select=seq(1,10)),type='response')
+  test.new_custom_model <- ifelse(test.new_custom_model > 0.1*k,1,0)
+  misClasificError <- mean(test.new_custom_model != new_test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+Followed the same process for new data with injury.score, not as good as the separate variables
+
+
+
+
+
+##### Custom model removing air exposure with k-fold cross validation
+
+k-fold cv does not work on the given data. there is some badly imbalanced categorical predictors, for example, hook.location has level 3 with only one record, which cannot be used in testing data. So, at least one fold cannot be used.
+
+```{r}
+# split the training data into five parts
+partition <- 180/5 # =36
+folds <- c(1:36, 37:72, 73:108, 109:144, 145:180)
+
+# Cross-Validation
+range.fold <- c(1,2,3,4,5)
+fold_acc <- c(1,2,3,4,5)
+for (k in range.fold){
+  train.data <- new_train[-((36*(k-1)+1):(36*k)),]
+  train.model <- glm(detection.status~hook.location+injury.score+reflex.score,
+                      family=binomial(link='logit'),data=train.data)
+  
+  # calculate validation accuracy:
+  
+  # check the categorical variables levels in validation data
+  # remove the 'new' levels in validation data
+  valid.variables <- new_train[(36*(k-1)+1):(36*k),1:10]
+  valid.data <- new_train[(36*(k-1)+1):(36*k),]
+  for (var in variable.names(train.data)){
+    train.var <- pull(train.data[var])
+    if (is.factor(train.var)){
+      train.levels <- unique(train.var)
+      valid.var <- pull(valid.data[var])
+      valid.levels <- unique(valid.var)
+      if (!(all(valid.levels %in% train.levels))){
+        # find the new level(s) in valid but not in train
+        new.levels <- valid.levels[!(valid.levels %in% train.levels)]
+        valid.variables <- valid.variables[which(valid.var %in% train.levels),]
+        valid.data <- valid.data[which(valid.var %in% train.levels),]
+      }
+    }
+  }
+
+  
+  
+  range.decision_boundary <- c(0,1,2,3,4,5,6,7,8,9,10)
+  accs <- c(0,1,2,3,4,5,6,7,8,9,10)
+  for (i in range.decision_boundary){
+    # training accuracy for different decision boundaries:
+    valid.model <- predict(train.model,newdata=train.data, type='response')
+    valid.model <- ifelse(valid.model > 0.1*i,1,0)
+    misClasificError <- mean(valid.model != train.data$detection.status)
+    accs[i+1] <- 1-misClasificError
+  }
+  # selection the max accuracy
+  train_acc[k] <- max(accs)
+  best_bound <- which.max(accs)
+  
+
+  
+  # compute the validation accuracy
+  accss <- c(1,2,3)
+  for (i in accss){
+    valid.model <- predict(train.model,newdata=valid.variables, type='response')
+    valid.model <- ifelse(valid.model > 0.1*(best_bound-2+i),1,0)
+    misClasificError <- mean(valid.model != valid.data$detection.status)
+    accss[i] <- 1-misClasificError
+  }
+  fold_acc[k] <- max(accss)
+}
+# calculate the mean of the max accuracies for the folds
+acccuracy_train <- mean(train_acc)
+acccuracy_cv <- mean(fold_acc)
+# outputs
+train_acc; acccuracy_train
+fold_acc; acccuracy_cv
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## split reflex.score
+
+#### Read data
+```{r}
+# read data and perspective
+newraw_data <- read_xlsx("updated_data_sepearate_variables.xlsx", sheet = "data", col_names = TRUE)
+head(newraw_data); dim(newraw_data)
+```
+
+#### Some columns incorrectly converted to char() due to NA
+```{r}
+# correct the variables data type
+# Warning: note that NAs introduced by coercion
+newraw_data <- newraw_data %>% 
+                mutate(air.exposure = as.double(air.exposure)) %>%
+                mutate(hook.location = as.double(hook.location)) %>%
+                mutate(mean.fat = as.double(mean.fat))
+head(newraw_data); dim(newraw_data)
+```
+
+#### Removing all the NA's and Unknown's as missing data (40 in total)
+```{r}
+# remove the missing data
+new_complete_data <- newraw_data %>% 
+                    filter(!is.na(air.exposure) & !is.na(hook.location) & !is.na(mean.fat) & 
+                            (tolower(population) != "unknown") & (tolower(sex) != "unknown") )
+head(new_complete_data); dim(new_complete_data)
+```
+
+#### Refine the data table (remove fish.no which is equivalent to tag.id)
+```{r}
+# remove fish.no column and check that tag.id is an unique identifier
+new_complete_data <- new_complete_data %>%
+                      select(-"fish.no")
+all(new_complete_data$tag.id == unique(new_complete_data$tag.id))
+head(new_complete_data); dim(new_complete_data)
+```
+
+#### Change the date to year
+```{r}
+new_complete_data <- new_complete_data %>%
+                      mutate(year=substr(date,1,4), .after=date)
+head(new_complete_data); dim(new_complete_data)
+```
+
+#### Remove injury.score and reflex.score
+```{r}
+# remove fish.no column and check that tag.id is an unique identifier
+new_complete_data <- new_complete_data %>%
+                      select(-"injury.score") %>% select(-"reflex.score") 
+all(new_complete_data$tag.id == unique(new_complete_data$tag.id))
+head(new_complete_data); dim(new_complete_data)
+```
+
+
+```{r}
+# For VOR treat as categorical variable:
+vs.vor <- table(new_complete_data$VOR, new_complete_data$detection.status)
+names(dimnames(vs.vor)) <- c("VOR", "detection.status")
+addmargins(vs.vor)
+
+# data visualization:
+vor_table <- table(new_complete_data$detection.status, new_complete_data$VOR)
+barplot(vor_table, xlab="VOR", col=c("grey", "light blue"), legend = rownames(vor_table), beside=TRUE)
+
+# data visualization with fractions
+bar_plot <- function(vor_table){
+  ggplot(as.data.frame(vor_table),aes(x=Var2,y=Freq,fill=Var1)) +
+      geom_bar(stat="identity",position="stack")+
+      xlab("VOR") + ylab("freq") + labs(fill="detection.status") +
+      geom_text(aes(label=fraction(Freq)),position="stack",vjust=1)+
+      scale_fill_manual(values=c("grey","light blue"))+
+      theme_bw()
+}
+bar_plot(vor_table)
+```
+
+```{r}
+# For VOR treat as categorical variable:
+vs.tail <- table(new_complete_data$tail.flex, new_complete_data$detection.status)
+names(dimnames(vs.tail)) <- c("tail.flex", "detection.status")
+addmargins(vs.tail)
+
+# data visualization:
+tail_table <- table(new_complete_data$detection.status, new_complete_data$tail.flex)
+barplot(tail_table, xlab="tail.flex", col=c("grey", "light blue"), legend = rownames(tail_table), beside=TRUE)
+
+# data visualization with fractions
+bar_plot <- function(tail_table){
+  ggplot(as.data.frame(tail_table),aes(x=Var2,y=Freq,fill=Var1)) +
+      geom_bar(stat="identity",position="stack")+
+      xlab("tail.flex") + ylab("freq") + labs(fill="detection.status") +
+      geom_text(aes(label=fraction(Freq)),position="stack",vjust=1)+
+      scale_fill_manual(values=c("grey","light blue"))+
+      theme_bw()
+}
+bar_plot(tail_table)
+```
+
+```{r}
+# For VOR treat as categorical variable:
+vs.body <- table(new_complete_data$body.flex, new_complete_data$detection.status)
+names(dimnames(vs.body)) <- c("body.flex", "detection.status")
+addmargins(vs.body)
+
+# data visualization:
+body_table <- table(new_complete_data$detection.status, new_complete_data$body.flex)
+barplot(body_table, xlab="body.flex", col=c("grey", "light blue"), legend = rownames(body_table), beside=TRUE)
+
+# data visualization with fractions
+bar_plot <- function(body_table){
+  ggplot(as.data.frame(body_table),aes(x=Var2,y=Freq,fill=Var1)) +
+      geom_bar(stat="identity",position="stack")+
+      xlab("body.flex") + ylab("freq") + labs(fill="detection.status") +
+      geom_text(aes(label=fraction(Freq)),position="stack",vjust=1)+
+      scale_fill_manual(values=c("grey","light blue"))+
+      theme_bw()
+}
+bar_plot(body_table)
+```
+
+```{r}
+# For VOR treat as categorical variable:
+vs.venting <- table(new_complete_data$venting, new_complete_data$detection.status)
+names(dimnames(vs.venting)) <- c("venting", "detection.status")
+addmargins(vs.venting)
+
+# data visualization:
+venting_table <- table(new_complete_data$detection.status, new_complete_data$venting)
+barplot(venting_table, xlab="venting", col=c("grey", "light blue"), legend = rownames(venting_table), beside=TRUE)
+
+# data visualization with fractions
+bar_plot <- function(venting_table){
+  ggplot(as.data.frame(venting_table),aes(x=Var2,y=Freq,fill=Var1)) +
+      geom_bar(stat="identity",position="stack")+
+      xlab("venting") + ylab("freq") + labs(fill="detection.status") +
+      geom_text(aes(label=fraction(Freq)),position="stack",vjust=1)+
+      scale_fill_manual(values=c("grey","light blue"))+
+      theme_bw()
+}
+bar_plot(venting_table)
+```
+
+```{r}
+# For VOR treat as categorical variable:
+vs.orientation <- table(new_complete_data$orientation, new_complete_data$detection.status)
+names(dimnames(vs.orientation)) <- c("orientation", "detection.status")
+addmargins(vs.orientation)
+
+# data visualization:
+orientation_table <- table(new_complete_data$detection.status, new_complete_data$orientation)
+barplot(orientation_table, xlab="orientation", col=c("grey", "light blue"), legend = rownames(vor_table), beside=TRUE)
+
+# data visualization with fractions
+bar_plot <- function(orientation_table){
+  ggplot(as.data.frame(orientation_table),aes(x=Var2,y=Freq,fill=Var1)) +
+      geom_bar(stat="identity",position="stack")+
+      xlab("orientation") + ylab("freq") + labs(fill="detection.status") +
+      geom_text(aes(label=fraction(Freq)),position="stack",vjust=1)+
+      scale_fill_manual(values=c("grey","light blue"))+
+      theme_bw()
+}
+bar_plot(orientation_table)
+```
+
+
+
+### Model fitting
+
+#### Factor the categorical variables
+```{r}
+## Factor
+new_fit_dataset<-new_complete_data %>% 
+                  mutate(year=as.factor(year)) %>% 
+                  mutate(population=as.factor(population)) %>% 
+                  mutate(sex=as.factor(sex)) %>%
+                  mutate(origin=as.factor(origin)) %>%
+                  mutate(hook.location=as.factor(hook.location)) %>%
+                  mutate(fin.damage=as.factor(fin.damage)) %>%
+                  mutate(wound.score=as.factor(wound.score)) %>%
+                  mutate(scale.loss=as.factor(scale.loss)) %>%
+                  mutate(eye.injury=as.factor(eye.injury)) %>%
+                  mutate(bleed=as.factor(bleed)) %>%
+                  mutate(VOR=as.factor(VOR)) %>%
+                  mutate(tail.flex=as.factor(tail.flex)) %>%
+                  mutate(body.flex=as.factor(body.flex)) %>%
+                  mutate(venting=as.factor(venting)) %>%
+                  mutate(orientation=as.factor(orientation)) %>%
+                  mutate(detection.status=as.factor(detection.status)) %>%
+                  #mutate(air.exposure=as.factor(air.exposure)) %>%
+                  select(-"tag.id") %>%
+                  select(-"date")
+
+str(new_fit_dataset)
+```
+
+
+#### Standardize
+```{r}
+new_fit_dataset$air.exposure <- scale(new_fit_dataset$air.exposure)
+str(new_fit_dataset)
+```
+
+
+#### Split into training dataset and testing dataset (4:1) proportional to detection.status
+```{r}
+# Sample from detected:
+
+new_detected <- new_fit_dataset %>% filter(detection.status == 1)
+smp_size <- floor(0.75 * nrow(new_detected))
+set.seed(450)
+new_detected_train <- sample(seq_len(nrow(new_detected)), size = smp_size)
+
+new_train_det <- new_detected[new_detected_train, ]
+new_test_det <- new_detected[-new_detected_train, ]
+
+# Sample from notdetected:
+new_notdetected <- new_fit_dataset %>% filter(detection.status == 0)
+smp_size <- floor(0.75 * nrow(new_notdetected))
+set.seed(451)
+new_notdetected_train <- sample(seq_len(nrow(new_notdetected)), size = smp_size)
+
+new_train_notdet <- new_notdetected[new_notdetected_train, ]
+new_test_notdet <- new_notdetected[-new_notdetected_train, ]
+
+# Combine detected and notdetected
+new_train <- rbind(new_train_det, new_train_notdet)
+new_test <- rbind(new_test_det, new_test_notdet)
+
+# Shuffle the rows
+#set.seed(452)
+new_rows_train <- sample(nrow(new_train))
+new_train <- new_train[new_rows_train, ]
+
+#set.seed(453)
+new_rows_test <- sample(nrow(new_test))
+new_test <- new_test[new_rows_test, ]
+```
+
+
+
+#### Full model
+```{r}
+# The full model
+new_fullmodel <- glm(detection.status~.,family=binomial(link='logit'),data=new_train)
+summary(new_fullmodel)
+```
+AIC = 227.49
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.new_fullmodel <- predict(new_fullmodel,newdata=subset(new_train,select=seq(1,18)),type='response')
+  train.new_fullmodel <- ifelse(train.new_fullmodel > 0.1*k,1,0)
+  misClasificError <- mean(train.new_fullmodel != new_train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.new_fullmodel <- predict(new_fullmodel,newdata=subset(new_test,select=seq(1,18)),type='response')
+  test.new_fullmodel <- ifelse(test.new_fullmodel > 0.1*k,1,0)
+  misClasificError <- mean(test.new_fullmodel != new_test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+#### Backward Selection
+```{r}
+# Backward Selection
+new_backwards = stats::step(new_fullmodel)
+summary(new_backwards)
+formula(new_backwards)
+```
+AIC = 213.02
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.new_backmodel <- predict(new_backwards,newdata=subset(new_train,select=seq(1,18)),type='response')
+  train.new_backmodel <- ifelse(train.new_backmodel > 0.1*k,1,0)
+  misClasificError <- mean(train.new_backmodel != new_train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.new_backmodel <- predict(new_backwards,newdata=subset(new_test,select=seq(1,18)),type='response')
+  test.new_backmodel <- ifelse(test.new_backmodel > 0.1*k,1,0)
+  misClasificError <- mean(test.new_backmodel != new_test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+#### Forward Selection
+
+```{r}
+# Forward Selection
+new_basemodel <- glm(detection.status~NULL, family=binomial(link='logit'),data=new_train);
+new_forwards <- stats::step(new_basemodel,scope=list(lower=formula(new_basemodel),upper=formula(new_fullmodel)), direction="forward");
+summary(new_forwards)
+formula(new_forwards)
+```
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.foremodel <- predict(new_forwards,newdata=subset(new_train,select=seq(1,18)),type='response')
+  train.foremodel <- ifelse(train.foremodel > 0.1*k,1,0)
+  misClasificError <- mean(train.foremodel != new_train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.new_foremodel <- predict(new_forwards,newdata=subset(new_test,select=seq(1,18)),type='response')
+  test.new_foremodel <- ifelse(test.new_foremodel > 0.1*k,1,0)
+  misClasificError <- mean(test.new_foremodel != new_test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+#### Custom Model
+
+```{r}
+# Custom model
+new_custom_model <- glm(detection.status~hook.location+eye.injury+fin.damage+orientation, family=binomial(link='logit'),data=new_train); # add reflex.score or not, does not affect the accuracy
+summary(new_custom_model)
+formula(new_custom_model)
+```
+AIC = 222.09
+
+Tried to factor air.exposure, it leads to higher training accuracy and lower testing accuracy (overfitting?).
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.new_custom_model <- predict(new_custom_model,newdata=subset(new_train,select=seq(1,18)),type='response')
+  train.new_custom_model <- ifelse(train.new_custom_model > 0.1*k,1,0)
+  misClasificError <- mean(train.new_custom_model != new_train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.new_custom_model <- predict(new_custom_model,newdata=subset(new_test,select=seq(1,18)),type='response')
+  test.new_custom_model <- ifelse(test.new_custom_model > 0.1*k,1,0)
+  misClasificError <- mean(test.new_custom_model != new_test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+##### Custom model removing air exposure with k-fold cross validation
+
+k-fold cv does not work on the given data. there is some badly imbalanced categorical predictors, for example, hook.location has level 3 with only one record, which cannot be used in testing data. So, at least one fold cannot be used.
+
+```{r}
+# split the training data into five parts
+partition <- 180/5 # =36
+folds <- c(1:36, 37:72, 73:108, 109:144, 145:180)
+
+# Cross-Validation
+range.fold <- c(1,2,3,4,5)
+fold_acc <- c(1,2,3,4,5)
+for (k in range.fold){
+  train.data <- new_train[-((36*(k-1)+1):(36*k)),]
+  train.model <- glm(detection.status~hook.location+eye.injury+fin.damage+orientation,
+                      family=binomial(link='logit'),data=train.data)
+  
+  # calculate validation accuracy:
+  
+  # check the categorical variables levels in validation data
+  # remove the 'new' levels in validation data
+  valid.variables <- new_train[(36*(k-1)+1):(36*k),1:18]
+  valid.data <- new_train[(36*(k-1)+1):(36*k),]
+  for (var in variable.names(train.data)){
+    train.var <- pull(train.data[var])
+    if (is.factor(train.var)){
+      train.levels <- unique(train.var)
+      valid.var <- pull(valid.data[var])
+      valid.levels <- unique(valid.var)
+      if (!(all(valid.levels %in% train.levels))){
+        # find the new level(s) in valid but not in train
+        new.levels <- valid.levels[!(valid.levels %in% train.levels)]
+        valid.variables <- valid.variables[which(valid.var %in% train.levels),]
+        valid.data <- valid.data[which(valid.var %in% train.levels),]
+      }
+    }
+  }
+
+  
+  
+  range.decision_boundary <- c(0,1,2,3,4,5,6,7,8,9,10)
+  accs <- c(0,1,2,3,4,5,6,7,8,9,10)
+  for (i in range.decision_boundary){
+    # training accuracy for different decision boundaries:
+    valid.model <- predict(train.model,newdata=train.data, type='response')
+    valid.model <- ifelse(valid.model > 0.1*i,1,0)
+    misClasificError <- mean(valid.model != train.data$detection.status)
+    accs[i+1] <- 1-misClasificError
+  }
+  # selection the max accuracy
+  train_acc[k] <- max(accs)
+  best_bound <- which.max(accs)
+  
+
+  
+  # compute the validation accuracy
+  accss <- c(1,2,3)
+  for (i in accss){
+    valid.model <- predict(train.model,newdata=valid.variables, type='response')
+    valid.model <- ifelse(valid.model > 0.1*(best_bound-3+i),1,0)
+    misClasificError <- mean(valid.model != valid.data$detection.status)
+    accss[i] <- 1-misClasificError
+  }
+  fold_acc[k] <- max(accss)
+}
+# calculate the mean of the max accuracies for the folds
+acccuracy_train <- mean(train_acc)
+acccuracy_cv <- mean(fold_acc)
+# outputs
+train_acc; acccuracy_train
+fold_acc; acccuracy_cv
+```
+
+
+
+##### Apply random forest model to test data
+
+```{r}
+rf_model <- randomForest(detection.status~eye.injury+hook.location+fin.damage+air.exposure+orientation, data = new_train, ntree = 1000, mtry = 2, importance = TRUE)
+rf_model
+```
+
+```{r}
+rftrain_pred <- predict(rf_model, new_train, type = "class")
+mean(rftrain_pred == new_train$detection.status) 
+table(rftrain_pred, new_train$detection.status)
+```
+The performance on training data is much better than all other models previously.
+
+```{r}
+rf_pred <- predict(rf_model, new_test, type = "class")
+mean(rf_pred == new_test$detection.status)
+table(rf_pred, new_test$detection.status)
+```
+
+
+
+
+
+
+### Try to remove imbalanced classes
+
+#### Read data
+```{r}
+# read data and perspective
+raw_data <- read_xlsx("Lunzmann-Cooke_data_20210124.xlsx", sheet = "data", col_names = TRUE)
+head(raw_data); dim(raw_data)
+```
+
+#### Some columns incorrectly converted to char() due to NA
+```{r}
+# correct the variables data type
+# Warning: note that NAs introduced by coercion
+raw_data <- raw_data %>% 
+                mutate(air.exposure = as.double(air.exposure)) %>%
+                mutate(hook.location = as.double(hook.location)) %>%
+                mutate(mean.fat = as.double(mean.fat))
+head(raw_data); dim(raw_data)
+```
+
+#### Check the missing data
+```{r}
+missmap(raw_data)
+```
+The number of missing data are relatively small. And since there is no reason to replace the missing values with the average, the median or the mode of the existing one, we would just discord these records.
+
+#### Removing all the NA's and Unknown's as missing data (40 in total)
+```{r}
+# remove the missing data
+complete_data <- raw_data %>% 
+                    filter(!is.na(air.exposure) & !is.na(hook.location) & !is.na(mean.fat) & 
+                            (tolower(population) != "unknown") & (tolower(sex) != "unknown") )
+head(complete_data); dim(complete_data)
+```
+
+#### Refine the data table (remove fish.no which is equivalent to tag.id)
+```{r}
+# remove fish.no column and check that tag.id is an unique identifier
+complete_data <- complete_data %>%
+                      select(-"fish.no")
+all(complete_data$tag.id == unique(complete_data$tag.id))
+head(complete_data); dim(complete_data)
+```
+
+#### Change the date to year
+```{r}
+complete_data <- complete_data %>%
+                      mutate(year=substr(date,1,4), .after=date)
+head(complete_data); dim(complete_data)
+```
+
+#### Remove scale loss level 3
+```{r}
+complete_data <- complete_data %>%
+                      filter(scale.loss!=3)
+head(complete_data); dim(complete_data)
+```
+
+### Model fitting
+
+#### Factor the categorical variables
+```{r}
+## Factor
+fit_dataset<-complete_data %>% 
+                  mutate(year=as.factor(year)) %>% 
+                  mutate(population=as.factor(population)) %>% 
+                  mutate(sex=as.factor(sex)) %>%
+                  mutate(origin=as.factor(origin)) %>%
+                  mutate(hook.location=as.factor(hook.location)) %>%
+                  mutate(fin.damage=as.factor(fin.damage)) %>%
+                  mutate(wound.score=as.factor(wound.score)) %>%
+                  mutate(scale.loss=as.factor(scale.loss)) %>%
+                  mutate(eye.injury=as.factor(eye.injury)) %>%
+                  mutate(bleed=as.factor(bleed)) %>%
+                  mutate(detection.status=as.factor(detection.status)) %>%
+                  #mutate(air.exposure=as.factor(air.exposure)) %>%
+                  select(-"tag.id") %>%
+                  select(-"date")
+
+str(fit_dataset)
+```
+
+_some problems: whether to set air.exposure and reflex.score as categorical variables, whether to standardize the continuous variables_
+
+
+#### Split into training dataset and testing dataset (4:1) proportional to detection.status
+```{r}
+# Sample from detected:
+
+detected <- fit_dataset %>% filter(detection.status == 1)
+smp_size <- floor(0.75 * nrow(detected))
+set.seed(450)
+detected_train <- sample(seq_len(nrow(detected)), size = smp_size)
+
+train_det <- detected[detected_train, ]
+test_det <- detected[-detected_train, ]
+
+# Sample from notdetected:
+notdetected <- fit_dataset %>% filter(detection.status == 0)
+smp_size <- floor(0.75 * nrow(notdetected))
+set.seed(451)
+notdetected_train <- sample(seq_len(nrow(notdetected)), size = smp_size)
+
+train_notdet <- notdetected[notdetected_train, ]
+test_notdet <- notdetected[-notdetected_train, ]
+
+# Combine detected and notdetected
+train <- rbind(train_det, train_notdet)
+test <- rbind(test_det, test_notdet)
+
+# Shuffle the rows
+#set.seed(452)
+rows_train <- sample(nrow(train))
+train <- train[rows_train, ]
+
+#set.seed(453)
+rows_test <- sample(nrow(test))
+test <- test[rows_test, ]
+```
+
+
+
+
+#### Fit logistic regression using training data (full_model, forwards, backwards, and their AIC)
+#### And check the training and testing accuracy (classification accuracy with different decision boundary)
+
+#### Full model
+```{r}
+# The full model
+fullmodel <- glm(detection.status~.,family=binomial(link='logit'),data=train)
+summary(fullmodel)
+```
+AIC = 227.49
+
+Scale loss is no longer significant.
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.fullmodel <- predict(fullmodel,newdata=subset(train,select=seq(1,14)),type='response')
+  train.fullmodel <- ifelse(train.fullmodel > 0.1*k,1,0)
+  misClasificError <- mean(train.fullmodel != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.fullmodel <- predict(fullmodel,newdata=subset(test,select=seq(1,14)),type='response')
+  test.fullmodel <- ifelse(test.fullmodel > 0.1*k,1,0)
+  misClasificError <- mean(test.fullmodel != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Backward Selection
+```{r}
+# Backward Selection
+backwards = stats::step(fullmodel)
+summary(backwards)
+formula(backwards)
+```
+AIC = 213.02
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.backmodel <- predict(backwards,newdata=subset(train,select=seq(1,14)),type='response')
+  train.backmodel <- ifelse(train.backmodel > 0.1*k,1,0)
+  misClasificError <- mean(train.backmodel != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.backmodel <- predict(backwards,newdata=subset(test,select=seq(1,14)),type='response')
+  test.backmodel <- ifelse(test.backmodel > 0.1*k,1,0)
+  misClasificError <- mean(test.backmodel != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Forward Selection
+
+```{r}
+# Forward Selection
+basemodel <- glm(detection.status~NULL, family=binomial(link='logit'),data=train);
+forwards <- stats::step(basemodel,scope=list(lower=formula(basemodel),upper=formula(fullmodel)), direction="forward");
+summary(forwards)
+formula(forwards)
+```
+AIC = 213.02
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.foremodel <- predict(forwards,newdata=subset(train,select=seq(1,14)),type='response')
+  train.foremodel <- ifelse(train.foremodel > 0.1*k,1,0)
+  misClasificError <- mean(train.foremodel != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.foremodel <- predict(forwards,newdata=subset(test,select=seq(1,14)),type='response')
+  test.foremodel <- ifelse(test.foremodel > 0.1*k,1,0)
+  misClasificError <- mean(test.foremodel != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Statistical Significant Predictors
+
+```{r}
+# Variable selection according to test
+anova(fullmodel, test="Chisq")
+sel_model <- glm(detection.status~eye.injury+hook.location+scale.loss+reflex.score+fin.damage+air.exposure, family=binomial(link='logit'),data=train);
+summary(sel_model)
+formula(sel_model)
+```
+AIC = 220.64
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.sel_model <- predict(sel_model,newdata=subset(train,select=seq(1,14)),type='response')
+  train.sel_model <- ifelse(train.sel_model > 0.1*k,1,0)
+  misClasificError <- mean(train.sel_model != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.sel_model <- predict(sel_model,newdata=subset(test,select=seq(1,14)),type='response')
+  test.sel_model <- ifelse(test.sel_model > 0.1*k,1,0)
+  misClasificError <- mean(test.sel_model != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+#### Statistical Significant Predictors removing scale loss
+
+```{r}
+# Variable selection according to test
+anova(fullmodel, test="Chisq")
+sel_model <- glm(detection.status~eye.injury+hook.location+reflex.score+fin.damage+origin, family=binomial(link='logit'),data=train);
+summary(sel_model)
+formula(sel_model)
+```
+AIC = 218.45
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.sel_model <- predict(sel_model,newdata=subset(train,select=seq(1,14)),type='response')
+  train.sel_model <- ifelse(train.sel_model > 0.1*k,1,0)
+  misClasificError <- mean(train.sel_model != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.sel_model <- predict(sel_model,newdata=subset(test,select=seq(1,14)),type='response')
+  test.sel_model <- ifelse(test.sel_model > 0.1*k,1,0)
+  misClasificError <- mean(test.sel_model != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+
+
+#### Custom Model
+
+```{r}
+# Custom model
+custom_model <- glm(detection.status~eye.injury+hook.location+fin.damage+reflex.score, family=binomial(link='logit'),data=train); # add reflex.score or not, does not affect the accuracy
+summary(custom_model)
+formula(custom_model)
+```
+AIC = 218.45
+
+Tried to factor air.exposure, it leads to higher training accuracy and lower testing accuracy (overfitting?).
+
+```{r}
+# training accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # training accuracy:
+  train.custom_model <- predict(custom_model,newdata=subset(train,select=seq(1,14)),type='response')
+  train.custom_model <- ifelse(train.custom_model > 0.1*k,1,0)
+  misClasificError <- mean(train.custom_model != train$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
+
+```{r}
+# testing accuracy:
+range <- c(0,1,2,3,4,5,6,7,8,9,10)
+for (k in range){
+  # testing accuracy:
+  test.custom_model <- predict(custom_model,newdata=subset(test,select=seq(1,14)),type='response')
+  test.custom_model <- ifelse(test.custom_model > 0.1*k,1,0)
+  misClasificError <- mean(test.custom_model != test$detection.status)
+  print(paste('Accuracy',1-misClasificError))
+}
+```
