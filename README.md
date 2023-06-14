@@ -29,12 +29,28 @@ Run the R Markdown file **4-salmon-mortality.Rmd**, which includes the code and 
 
 ### Some plots and tables you might get if the project works properly:
 
+**Figure 1.** Frequency of each response variable level for each year
+
 ![Alt text](/plots_and_tables/year.png "Figure 1. Frequency of each response variable level for each year")
+
+**Figure 2.** Frequency of each response variable level for whether the fish has eye injury
+
 ![Alt text](/plots_and_tables/eyeinjury.png "Figure 2. Frequency of each response variable level for whether the fish has eye injury")
+
+**Figure 3.** Frequency of each response variable level for different scale loss extent
+
 ![Alt text](/plots_and_tables/scaleloss.png "Figure 3. Frequency of each response variable level for different scale loss extent")
+
+**Figure 4.** Parallel box plots for detection status versus air exposure time
+
 ![Alt text](/plots_and_tables/airexposure.png "Figure 4. Parallel box plots for detection status versus air exposure time")
 
+**Table 1.** Summary of Some Representative Models Trained
+
 ![Alt text](/plots_and_tables/table1.png "Table 1. Summary of Some Representative Models Trained")
+
+**Table 2.** Interpretations of Representative Models stated before
+
 ![Alt text](/plots_and_tables/table2.png "Table 2. Interpretations of Representative Models stated before")
 
 ### Some conclusions
